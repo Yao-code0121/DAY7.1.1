@@ -45,11 +45,11 @@
 
 /* ================= 电机 ================= */
 #define MOTOR_ID             1U
-#define MOTOR_OFFLINE_MS     100U     /* 超过 100ms 没收到反馈 -> 判离线 */
+#define MOTOR_OFFLINE_MS     100U
 
 /* ================= PID ================= */
 #define PID_DT               0.001f   /* 必须等于 TIM2 周期：1ms */
-#define PID_OUT_MAX          15000.0f /* 电压单位，满量程 25000 */
+#define PID_OUT_MAX          15000.0f
 #define PID_KP_DEFAULT       75.0f
 #define PID_KI_DEFAULT       100.0f
 #define PID_KD_DEFAULT       0.02f
@@ -62,17 +62,25 @@
 #define SERVO_MIN_US         500U     /* 0.5ms 一端极限 */
 #define SERVO_MAX_US         2500U    /* 2.5ms 另一端极限 */
 #define SERVO_STEP_US        223U     /* 每按一次 223us，约 20 度 */
-#define Lastingtime          50U      /* 两次按键最小间隔，防抖 */
+#define KEY_DEBOUNCE_MS      50U      /* 两次按键最小间隔，防抖 */
 
 /* ========= 电机状态：队列里传的就是这三个数 ========= */
-#define MOTOR_ST_OFFLINE     0U       /* 离线 */
-#define MOTOR_ST_SPINUP      1U       /* 正在追目标速度 */
-#define MOTOR_ST_READY       2U       /* 已经稳定在目标附近 */
+typedef enum
+{
+  MOTOR_ST_OFFLINE = 0,   /* 离线 */
+  MOTOR_ST_SPINUP  = 1,   /* 正在追目标速度 */
+  MOTOR_ST_READY   = 2,   /* 已经稳定在目标附近 */
+  MOTOR_ST_NONE    = 3    /* 还没收到过状态，只拿来当初始值 */
+} MotorState_t;
 
+/* ========= 呼吸灯的一组状态 ========= */
+typedef struct
+{
+  int16_t  duty;      /* 当前亮度 0~1000 */
+  int8_t   sgn;       /* +1 变亮，-1 变暗 */
+  uint32_t last_ms;   /* 上一次变亮度的时刻 */
+} LedBreath_t;
 /* ================= LED ================= */
-/* C 板三颗灯：PH10 蓝 / PH11 绿 / PH12 红。
-   红灯改成了 TIM5_CH3 的硬件 PWM，亮度由 CCR3 决定，不再写 GPIO；
-   绿灯保持原样，还是普通推挽输出，写 1 亮、写 0 灭。 */
 #define LED_PORT             GPIOH
 #define LED_GREEN_PIN        GPIO_PIN_11   /* 绿灯：GPIO 常亮 */
 
@@ -80,6 +88,14 @@
 #define LED_CCR_MAX          1000U         /* PSC=83, ARR=999 -> 1000Hz，CCR 0~1000 = 0~100% */
 #define LED_STEP_CCR         10U           /* 每级 1%，共 100 级 */
 #define LED_STEP_MS          10U           /* 每 10ms 变一级：100 级 x 10ms = 1 秒走完全程 */
+
+/* ========= 队列 / 串口 / 判定阈值 ========= */
+#define QUEUE_LEN            16U      /* 队列里最多排 16 条消息 */
+#define UART_TX_BUF_SIZE     96U      /* 串口发送缓冲长度 */
+#define UART_PRINT_MS        2000U    /* 每隔 2 秒打印一次状态 */
+#define UART_TX_TIMEOUT_MS   100U     /* 串口发送超时 */
+#define READY_ERR_RPM        10.0f    /* 误差小于 10rpm 就算稳住了 */
+#define SPEED_LIMIT_RPM      300.0f   /* 目标转速上限 */
 
 /* USER CODE END PD */
 
@@ -111,8 +127,8 @@ volatile uint8_t g_uart_rx_len  = 0;
 volatile uint8_t g_uart_rx_flag = 0;
 
 /* ---- 舵机当前脉宽 ---- */
-uint16_t servo_ccr     = SERVO_MIN_US;   /* 当前脉宽，从 500 开始 */
-int8_t   dir           = 1;              /* +1 往右走，-1 往左走 */
+uint16_t g_servo_ccr_us     = SERVO_MIN_US;   /* 当前脉宽，从 500 开始 */
+int8_t   g_servo_dir           = 1;              /* +1 往右走，-1 往左走 */
 uint32_t key_last_time = 0;              /* 上次按键时刻，必须是 uint32_t */
 
 
@@ -199,13 +215,13 @@ void MX_FREERTOS_Init(void) {
 
   /* Create the queue(s) */
   /* creation of myQueue01 */
-  myQueue01Handle = osMessageQueueNew (16, sizeof(uint16_t), &myQueue01_attributes);
+  myQueue01Handle = osMessageQueueNew (QUEUE_LEN, sizeof(MotorState_t), &myQueue01_attributes);
 
   /* creation of myQueue02 */
-  myQueue02Handle = osMessageQueueNew (16, sizeof(uint16_t), &myQueue02_attributes);
+  myQueue02Handle = osMessageQueueNew (QUEUE_LEN, sizeof(MotorState_t), &myQueue02_attributes);
 
   /* creation of myQueue03 */
-  myQueue03Handle = osMessageQueueNew (16, sizeof(uint16_t), &myQueue03_attributes);
+  myQueue03Handle = osMessageQueueNew (QUEUE_LEN, sizeof(MotorState_t), &myQueue03_attributes);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -234,6 +250,27 @@ void MX_FREERTOS_Init(void) {
 
 }
 
+/**
+ * @brief  呼吸灯走一步：更新亮度并写进 CCR
+ * @param  led 呼吸灯的状态（亮度、方向、上次时刻）
+ * @retval None
+ */
+static void Led_Breath_Step(LedBreath_t *led)
+{
+  /* 把当前亮度写进比较寄存器，占空比立刻改变 */
+  __HAL_TIM_SET_COMPARE(&htim5, LED_CH_RED, (uint32_t)led->duty);
+
+  /* 每 10ms 才动一格 */
+  if ((HAL_GetTick() - led->last_ms) >= LED_STEP_MS)
+  {
+    led->last_ms += LED_STEP_MS;
+    led->duty = (int16_t)(led->duty + led->sgn * (int16_t)LED_STEP_CCR);
+
+    if (led->duty >= (int16_t)LED_CCR_MAX) { led->duty = (int16_t)LED_CCR_MAX; led->sgn = -1; }
+    if (led->duty <= 0)                    { led->duty = 0;                    led->sgn =  1; }
+  }
+}
+
 /* USER CODE BEGIN Header_StartLEDTASK */
 /**
   * @brief  Function implementing the LEDTASK thread.
@@ -244,51 +281,47 @@ void MX_FREERTOS_Init(void) {
 void StartLEDTASK(void *argument)
 {
   /* USER CODE BEGIN StartLEDTASK */
-  uint16_t state  = MOTOR_ST_OFFLINE;
-  uint16_t got;
-  int16_t  duty   = 0;      /* 0~1000。必须是 int16_t，int8_t 装不下 1000 */
-  int8_t   sgn    = 1;      /* +1 变亮，-1 变暗 */
-  uint32_t t_lvl  = 0U;
+  MotorState_t state = MOTOR_ST_OFFLINE;   /* 当前电机状态 */
+  MotorState_t got;                        /* 从队列收到的状态 */
+  LedBreath_t  led   = {0, 1, 0U};         /* 呼吸灯：亮度0，方向+1，时刻0 */
 
   /* 绿灯仍是普通 GPIO，先灭掉 */
   HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
 
-  /* 红灯改成 TIM5_CH3 硬件 PWM：启动通道 + 先把占空比清 0 */
+  /* 红灯 = TIM5_CH3 硬件 PWM：启动通道，占空比先清 0 */
   (void)HAL_TIM_PWM_Start(&htim5, LED_CH_RED);
   __HAL_TIM_SET_COMPARE(&htim5, LED_CH_RED, 0U);
 
-  t_lvl = HAL_GetTick();
+  led.last_ms = HAL_GetTick();
 
   for(;;)
   {
+    /* 1. 有状态就先收下 */
     if (osMessageQueueGet(myQueue01Handle, &got, NULL, 0) == osOK)
     {
       state = got;
     }
 
-    if (state == MOTOR_ST_OFFLINE)
+    /* 2. 按状态分头处理 */
+    switch (state)
     {
-      HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+      case MOTOR_ST_OFFLINE:            /* 离线：红灯呼吸，绿灯灭 */
+        HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+        Led_Breath_Step(&led);
+        break;
 
-      __HAL_TIM_SET_COMPARE(&htim5, LED_CH_RED, (uint32_t)duty);
-
-      if ((HAL_GetTick() - t_lvl) >= LED_STEP_MS)
-      {
-        t_lvl += LED_STEP_MS;
-        duty = (int16_t)(duty + sgn * (int16_t)LED_STEP_CCR);
-        if (duty >= (int16_t)LED_CCR_MAX) { duty = (int16_t)LED_CCR_MAX; sgn = -1; }
-        if (duty <= 0)                    { duty = 0;                    sgn =  1; }
-      }
-    }
-    else
-    {
-      __HAL_TIM_SET_COMPARE(&htim5, LED_CH_RED, 0U);
-      HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
-      duty  = 0;
-      sgn   = 1;
-      t_lvl = HAL_GetTick();
+      case MOTOR_ST_SPINUP:             /* 正在追速度 */
+      case MOTOR_ST_READY:              /* 已经稳住 */
+      default:                          /* 红灯灭，绿灯常亮 */
+        __HAL_TIM_SET_COMPARE(&htim5, LED_CH_RED, 0U);
+        HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
+        led.duty    = 0;
+        led.sgn     = 1;
+        led.last_ms = HAL_GetTick();
+        break;
     }
 
+    /* 3. 让出 CPU */
     osDelay(1);
   }
   /* USER CODE END StartLEDTASK */
@@ -304,7 +337,7 @@ void StartLEDTASK(void *argument)
 void StartusartTASK(void *argument)
 {
   /* USER CODE BEGIN StartusartTASK */
-  static char tx[96];
+  static char tx[UART_TX_BUF_SIZE];
   uint8_t     local[UART_RX_BUF_SIZE + 1U];  /* +1 是留给结尾 '\0'，否则 n=64 时 local[64] 会越界 */
   uint8_t     n;
   uint8_t     i;
@@ -339,7 +372,7 @@ void StartusartTASK(void *argument)
       }
     }
 
-    if ((HAL_GetTick() - last_print) >= 2000U)
+    if ((HAL_GetTick() - last_print) >= UART_PRINT_MS)
     {
       last_print = HAL_GetTick();
       len = snprintf(tx, sizeof(tx), "tgt=%d act=%d out=%d\r\n",
@@ -362,8 +395,8 @@ void StartusartTASK(void *argument)
 void Startdianji6020TASK(void *argument)
 {
   /* USER CODE BEGIN Startdianji6020TASK */
-  uint16_t last_state = 0xFFFFU;
-  uint16_t state;
+  MotorState_t last_state = MOTOR_ST_NONE;
+  MotorState_t state;
   float    err;
   BSP_CAN_Init(&hcan1);
   GM6020_Init(&motor1, MOTOR_ID);
@@ -409,7 +442,7 @@ void Startdianji6020TASK(void *argument)
     {
       err = g_actual_speed - speed_pid.target;
       if (err < 0.0f) { err = -err; }
-      state = (err < 10.0f) ? MOTOR_ST_READY : MOTOR_ST_SPINUP;
+      state = (err < READY_ERR_RPM) ? MOTOR_ST_READY : MOTOR_ST_SPINUP;
     }
 
     if (state != last_state)
@@ -435,49 +468,55 @@ void StartduojiTASK(void *argument)
   uint8_t key_now  = 1U;   /* 本次读到的电平：1=松开，0=按下 */
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, servo_ccr);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, g_servo_ccr_us);
 
   for(;;)
   {
     key_now = (uint8_t)HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
 
-    if ((HAL_GetTick() - key_last_time) >= Lastingtime && (key_now == 0U))
+    if (((HAL_GetTick() - key_last_time) >= KEY_DEBOUNCE_MS) && (key_now == 0U))
     {
+      key_last_time = HAL_GetTick();
 
-        key_last_time = HAL_GetTick();
-
-        if (dir == 1)
+      if (g_servo_dir == 1)
+      {
+        g_servo_ccr_us = (uint16_t)(g_servo_ccr_us + SERVO_STEP_US);
+        if (g_servo_ccr_us >= SERVO_MAX_US)
         {
-          servo_ccr = (uint16_t)(servo_ccr + SERVO_STEP_US);
-          if (servo_ccr >= SERVO_MAX_US)
-          {
-            servo_ccr = SERVO_MAX_US;
-            dir = -1;
-          }
+          g_servo_ccr_us = SERVO_MAX_US;
+          g_servo_dir = -1;
         }
-        else
-        {
-          servo_ccr = (uint16_t)(servo_ccr - SERVO_STEP_US);
-          if (servo_ccr <= SERVO_MIN_US)
-          {
-            servo_ccr = SERVO_MIN_US;
-            dir = 1;
-          }
-        }
-
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, servo_ccr);
       }
+      else
+      {
+        g_servo_ccr_us = (uint16_t)(g_servo_ccr_us - SERVO_STEP_US);
+        if (g_servo_ccr_us <= SERVO_MIN_US)
+        {
+          g_servo_ccr_us = SERVO_MIN_US;
+          g_servo_dir = 1;
+        }
+      }
+
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, g_servo_ccr_us);
     }
 
-    key_now=1;
     osDelay(10);
   }
   /* USER CODE END StartduojiTASK */
+}
 
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
 
+/**
+ * @brief  解析串口收到的电机指令，格式 "motor+100\r\n"
+ * @param  s    收到的字符串，必须以 '\0' 结尾
+ * @param  len  字符串长度（不含 '\0'）
+ * @param  out  解析出的目标转速写到这里，单位 rpm
+ * @return 1 表示解析成功，0 表示格式不对
+ * @note   会修改 *out，其他全局变量都不动；只在串口任务里调用，不涉及并发
+ */
 static uint8_t App_ParseMotorCmd(const char *s, uint8_t len, float *out)
 {
   int32_t v = 0;
@@ -502,16 +541,23 @@ static uint8_t App_ParseMotorCmd(const char *s, uint8_t len, float *out)
   if ((i < len) && (s[i] != '\r')) { return 0U; }
 
   v *= sign;
-  if (v >  300) { v =  300; }
-  if (v < -300) { v = -300; }
+  if (v >  (int32_t)SPEED_LIMIT_RPM) { v =  (int32_t)SPEED_LIMIT_RPM; }
+  if (v < -(int32_t)SPEED_LIMIT_RPM) { v = -(int32_t)SPEED_LIMIT_RPM; }
 
   *out = (float)v;
   return 1U;
 }
 
+/**
+ * @brief  阻塞发送一段字符串到 USART6
+ * @param  s  要发的数据
+ * @param  n  字节数
+ * @retval None
+ * @note   阻塞发送，96 字节 @115200 约 8ms；只在串口任务里调用，不要在中断里调
+ */
 static void App_UartSend(const char *s, uint16_t n)
 {
-  (void)HAL_UART_Transmit(&huart6, (const uint8_t *)s, n, 100U);
+  (void)HAL_UART_Transmit(&huart6, (const uint8_t *)s, n, UART_TX_TIMEOUT_MS);
 }
 
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
