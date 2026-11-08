@@ -1,0 +1,256 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * File Name          : freertos.c
+  * Description        : Code for freertos applications
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "main.h"
+#include "cmsis_os.h"
+#include "pid.h"          // PID_t 和 PID_Init/PID_Calc
+#include "dji_motor.h"    // GM6020_t 和 GM6020_xxx
+#include "bsp_can.h"      // CAN 发送函数
+#include "usart.h"        // huart6
+#include "can.h"          // hcan1
+#include "tim.h"          // htim1（舵机 PWM）
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+MOTOR_ID            电机 ID，实测是 1
+MOTOR_OFFLINE_MS    判离线阈值 100ms
+PID_DT              PID 周期 0.001f，必须等于 TIM2 的 1ms
+PID_OUT_MAX         输出上限 15000.0f
+PID_KP_DEFAULT      建议 90.0f（1ms 周期下）
+PID_KI_DEFAULT      建议 90.0f
+PID_KD_DEFAULT      建议 0.02f
+SERVO_MIN_US        500
+SERVO_MAX_US        2500
+SERVO_STEP_US       222
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN Variables */
+
+/* USER CODE END Variables */
+/* Definitions for LEDTASK */
+osThreadId_t LEDTASKHandle;
+const osThreadAttr_t LEDTASK_attributes = {
+  .name = "LEDTASK",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for usartTASK */
+osThreadId_t usartTASKHandle;
+const osThreadAttr_t usartTASK_attributes = {
+  .name = "usartTASK",
+  .stack_size = 258 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for dianji6020TASK */
+osThreadId_t dianji6020TASKHandle;
+const osThreadAttr_t dianji6020TASK_attributes = {
+  .name = "dianji6020TASK",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for duojiTASK */
+osThreadId_t duojiTASKHandle;
+const osThreadAttr_t duojiTASK_attributes = {
+  .name = "duojiTASK",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for myQueue01 */
+osMessageQueueId_t myQueue01Handle;
+const osMessageQueueAttr_t myQueue01_attributes = {
+  .name = "myQueue01"
+};
+/* Definitions for myQueue02 */
+osMessageQueueId_t myQueue02Handle;
+const osMessageQueueAttr_t myQueue02_attributes = {
+  .name = "myQueue02"
+};
+/* Definitions for myQueue03 */
+osMessageQueueId_t myQueue03Handle;
+const osMessageQueueAttr_t myQueue03_attributes = {
+  .name = "myQueue03"
+};
+
+/* Private function prototypes -----------------------------------------------*/
+/* USER CODE BEGIN FunctionPrototypes */
+
+/* USER CODE END FunctionPrototypes */
+
+void StartLEDTASK(void *argument);
+void StartusartTASK(void *argument);
+void Startdianji6020TASK(void *argument);
+void StartduojiTASK(void *argument);
+
+void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
+
+/**
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* Create the queue(s) */
+  /* creation of myQueue01 */
+  myQueue01Handle = osMessageQueueNew (16, sizeof(uint16_t), &myQueue01_attributes);
+
+  /* creation of myQueue02 */
+  myQueue02Handle = osMessageQueueNew (16, sizeof(uint16_t), &myQueue02_attributes);
+
+  /* creation of myQueue03 */
+  myQueue03Handle = osMessageQueueNew (16, sizeof(uint16_t), &myQueue03_attributes);
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of LEDTASK */
+  LEDTASKHandle = osThreadNew(StartLEDTASK, NULL, &LEDTASK_attributes);
+
+  /* creation of usartTASK */
+  usartTASKHandle = osThreadNew(StartusartTASK, NULL, &usartTASK_attributes);
+
+  /* creation of dianji6020TASK */
+  dianji6020TASKHandle = osThreadNew(Startdianji6020TASK, NULL, &dianji6020TASK_attributes);
+
+  /* creation of duojiTASK */
+  duojiTASKHandle = osThreadNew(StartduojiTASK, NULL, &duojiTASK_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+}
+
+/* USER CODE BEGIN Header_StartLEDTASK */
+/**
+  * @brief  Function implementing the LEDTASK thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartLEDTASK */
+void StartLEDTASK(void *argument)
+{
+  /* USER CODE BEGIN StartLEDTASK */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartLEDTASK */
+}
+
+/* USER CODE BEGIN Header_StartusartTASK */
+/**
+* @brief Function implementing the usartTASK thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartusartTASK */
+void StartusartTASK(void *argument)
+{
+  /* USER CODE BEGIN StartusartTASK */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartusartTASK */
+}
+
+/* USER CODE BEGIN Header_Startdianji6020TASK */
+/**
+* @brief Function implementing the dianji6020TASK thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_Startdianji6020TASK */
+void Startdianji6020TASK(void *argument)
+{
+  /* USER CODE BEGIN Startdianji6020TASK */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END Startdianji6020TASK */
+}
+
+/* USER CODE BEGIN Header_StartduojiTASK */
+/**
+* @brief Function implementing the duojiTASK thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartduojiTASK */
+void StartduojiTASK(void *argument)
+{
+  /* USER CODE BEGIN StartduojiTASK */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartduojiTASK */
+}
+
+/* Private application code --------------------------------------------------*/
+/* USER CODE BEGIN Application */
+
+/* USER CODE END Application */
+

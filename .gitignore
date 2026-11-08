@@ -1,0 +1,16 @@
+# 编译产物，38MB，不要提交
+build/
+cmake-build-*/
+
+# CLion 的本地配置
+.idea/
+
+# 调试用的备份文件
+*.bak*
+*.ioc.bak*
+
+# 编译生成的可执行文件
+*.elf
+*.hex
+*.bin
+*.map
