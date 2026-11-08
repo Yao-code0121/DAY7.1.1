@@ -257,7 +257,6 @@ void MX_FREERTOS_Init(void) {
  */
 static void Led_Breath_Step(LedBreath_t *led)
 {
-  /* 把当前亮度写进比较寄存器，占空比立刻改变 */
   __HAL_TIM_SET_COMPARE(&htim5, LED_CH_RED, (uint32_t)led->duty);
 
   /* 每 10ms 才动一格 */
@@ -266,8 +265,12 @@ static void Led_Breath_Step(LedBreath_t *led)
     led->last_ms += LED_STEP_MS;
     led->duty = (int16_t)(led->duty + led->sgn * (int16_t)LED_STEP_CCR);
 
-    if (led->duty >= (int16_t)LED_CCR_MAX) { led->duty = (int16_t)LED_CCR_MAX; led->sgn = -1; }
-    if (led->duty <= 0)                    { led->duty = 0;                    led->sgn =  1; }
+    if (led->duty >= (int16_t)LED_CCR_MAX) {
+      led->duty = (int16_t)LED_CCR_MAX; led->sgn = -1;
+    }
+    if (led->duty <= 0) {
+      led->duty = 0;                    led->sgn =  1;
+    }
   }
 }
 
@@ -296,13 +299,11 @@ void StartLEDTASK(void *argument)
 
   for(;;)
   {
-    /* 1. 有状态就先收下 */
     if (osMessageQueueGet(myQueue01Handle, &got, NULL, 0) == osOK)
     {
       state = got;
     }
 
-    /* 2. 按状态分头处理 */
     switch (state)
     {
       case MOTOR_ST_OFFLINE:            /* 离线：红灯呼吸，绿灯灭 */
